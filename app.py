@@ -226,7 +226,8 @@ User request in English:
 {english_query}
 """.strip()
     raw_sql = call_ollama(model=model, prompt=prompt, host=host, temperature=0)
-    return cleanup_sql(raw_sql)
+    cleaned = cleanup_sql(raw_sql)
+    return extract_first_sql_statement(cleaned)
 
 
 def clean_translation_response(text: str) -> str:
@@ -244,7 +245,30 @@ def cleanup_sql(text: str) -> str:
     return text
 
 
+def extract_first_sql_statement(text: str) -> str:
+    """
+    Extract the first SELECT/WITH SQL statement from model output, even when the
+    model adds extra explanation text.
+    """
+    normalized = text.strip()
+    if not normalized:
+        return ""
+
+    sql_start = re.search(r"\b(select|with)\b", normalized, flags=re.IGNORECASE)
+    if not sql_start:
+        return normalized
+
+    candidate = normalized[sql_start.start():].strip()
+    # Split on semicolon and keep the first statement when available.
+    first_statement = candidate.split(";", 1)[0].strip()
+    if first_statement:
+        return first_statement + ";"
+
+    return candidate
+
+
 def is_safe_readonly_sql(sql: str) -> Tuple[bool, str]:
+    sql = extract_first_sql_statement(sql)
     normalized = re.sub(r"\s+", " ", sql.strip().lower())
     if not normalized:
         return False, "Empty SQL generated."
