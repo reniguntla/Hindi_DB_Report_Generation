@@ -1,18 +1,23 @@
 import os
 import re
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
+from urllib.parse import quote_plus
 
 import pandas as pd
 import psycopg2
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
 
 load_dotenv()
 
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
 DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+DEFAULT_OLLAMA_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
 
 
 @dataclass
@@ -101,10 +106,18 @@ def fetch_schema_markdown(config: DBConfig) -> str:
     ORDER BY tc.table_schema, tc.table_name, tc.constraint_type;
     """
 
-    with get_connection(config) as conn:
-        tables = pd.read_sql(table_sql, conn)
-        columns = pd.read_sql(column_sql, conn)
-        keys = pd.read_sql(key_sql, conn)
+    uri = (
+        f"postgresql+psycopg2://{quote_plus(config.user)}:{quote_plus(config.password)}"
+        f"@{config.host}:{config.port}/{config.dbname}"
+    )
+    engine = create_engine(uri, pool_pre_ping=True)
+
+    with engine.connect() as conn:
+        tables = pd.read_sql_query(table_sql, conn)
+        columns = pd.read_sql_query(column_sql, conn)
+        keys = pd.read_sql_query(key_sql, conn)
+
+    engine.dispose()
 
     lines: List[str] = ["# Database Schema Context"]
     for _, table in tables.iterrows():
@@ -140,24 +153,54 @@ def fetch_schema_markdown(config: DBConfig) -> str:
     return "\n".join(lines)
 
 
-def call_ollama(model: str, prompt: str, host: str, temperature: float = 0.1) -> str:
+def call_ollama(
+    model: str,
+    prompt: str,
+    host: str,
+    temperature: float = 0.1,
+    timeout_seconds: int = DEFAULT_OLLAMA_TIMEOUT,
+    max_retries: int = DEFAULT_OLLAMA_RETRIES,
+) -> str:
     """Call local Ollama generate API."""
     url = f"{host.rstrip('/')}/api/generate"
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {
+            "temperature": temperature,
+            "num_ctx": 8192,
+        },
     }
-    response = requests.post(url, json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json().get("response", "").strip()
+    errors: List[str] = []
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=(10, timeout_seconds))
+            response.raise_for_status()
+            return response.json().get("response", "").strip()
+        except requests.exceptions.ReadTimeout:
+            wait_seconds = min(2 * attempt, 8)
+            errors.append(
+                f"Attempt {attempt}/{max_retries}: model response timed out after {timeout_seconds}s."
+            )
+            time.sleep(wait_seconds)
+        except requests.exceptions.RequestException as exc:
+            errors.append(f"Attempt {attempt}/{max_retries}: {exc}")
+            time.sleep(1)
+
+    raise RuntimeError("Ollama call failed. " + " ".join(errors))
 
 
 def translate_hindi_to_english(user_input_hindi: str, model: str, host: str) -> str:
     prompt = f"""
-Translate the following Hindi query into concise, clear English.
-Return ONLY the English translation text.
+You are an expert Hindi-to-English translator for analytics and SQL reporting.
+Translate the Hindi query into concise and clear English.
+Rules:
+- Preserve business entities and numbers exactly.
+- Keep date/period intent explicit.
+- If a Hindi word is already an English identifier (e.g., salary, employee_id), keep it unchanged.
+- Return ONLY the English translation text (no explanation, no quotes).
 
 Hindi:
 {user_input_hindi}
@@ -184,6 +227,13 @@ User request in English:
 """.strip()
     raw_sql = call_ollama(model=model, prompt=prompt, host=host, temperature=0)
     return cleanup_sql(raw_sql)
+
+
+def clean_translation_response(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^translation\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip('"').strip("'").strip()
+    return text
 
 
 def cleanup_sql(text: str) -> str:
@@ -303,9 +353,13 @@ def main() -> None:
         with st.spinner("हिंदी → English translation..."):
             try:
                 english_query = translate_hindi_to_english(user_hindi_query, model_name, ollama_host)
+                english_query = clean_translation_response(english_query)
             except Exception as exc:
                 st.error(f"Translation failed: {exc}")
                 st.stop()
+
+        st.markdown("### Translated Query (English)")
+        st.info(english_query)
 
         with st.spinner("SQL generate हो रहा है..."):
             try:

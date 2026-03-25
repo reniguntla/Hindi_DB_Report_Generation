@@ -6,6 +6,7 @@ This app lets users ask questions in **Hindi**, translates them to English, gene
 
 - Hindi natural language input
 - Hindi → English translation using Phi-3 (Ollama)
+- Translated English query is shown in UI for transparency
 - Schema-aware SQL generation using:
   - table/column metadata
   - data types
@@ -52,6 +53,8 @@ export PGSSLMODE=prefer
 
 export OLLAMA_HOST=http://localhost:11434
 export OLLAMA_MODEL=phi3:mini
+export OLLAMA_TIMEOUT_SECONDS=180
+export OLLAMA_MAX_RETRIES=3
 ```
 
 ### Optional: `.streamlit/secrets.toml`
