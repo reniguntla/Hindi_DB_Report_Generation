@@ -254,17 +254,23 @@ def extract_first_sql_statement(text: str) -> str:
     if not normalized:
         return ""
 
-    sql_start = re.search(r"\b(select|with)\b", normalized, flags=re.IGNORECASE)
-    if not sql_start:
+    sql_starts = list(re.finditer(r"\b(select|with)\b", normalized, flags=re.IGNORECASE))
+    if not sql_starts:
         return normalized
 
-    candidate = normalized[sql_start.start():].strip()
-    # Split on semicolon and keep the first statement when available.
-    first_statement = candidate.split(";", 1)[0].strip()
-    if first_statement:
-        return first_statement + ";"
+    for start_match in sql_starts:
+        candidate = normalized[start_match.start():].strip()
+        first_statement = candidate.split(";", 1)[0].strip()
+        compact = re.sub(r"\s+", " ", first_statement).strip()
+        # Skip narrative patterns like: "SELECT query would be as follows:"
+        if re.match(r"(?i)^select\s+query\b", compact):
+            continue
+        if re.match(r"(?i)^(select|with)\s+", compact):
+            return first_statement + ";"
 
-    return candidate
+    # Fallback to last detected SQL-like block if all candidates look noisy.
+    fallback = normalized[sql_starts[-1].start():].strip().split(";", 1)[0].strip()
+    return fallback + ";" if fallback else normalized
 
 
 def is_safe_readonly_sql(sql: str) -> Tuple[bool, str]:
